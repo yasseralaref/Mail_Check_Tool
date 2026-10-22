@@ -6,7 +6,7 @@ from email import policy
 from email.parser import BytesParser, Parser
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -42,7 +42,13 @@ textarea{display:block;width:100%;min-height:330px;resize:vertical;padding:13px;
 <main><div class="workspace">
 <section class="panel input-panel" aria-labelledby="input-title"><div class="section-head"><h2 id="input-title">Email source</h2><label class="upload">Open .eml<input id="file" type="file" accept=".eml,message/rfc822,text/plain"></label></div>
 <textarea id="email" placeholder="Paste the full raw email, including headers, here..." spellcheck="false"></textarea>
-<div class="actions"><span class="hint">Local only · Maximum 1 MB</span><button id="analyze">Analyze email</button></div><div class="vt-config"><label for="vt-key">VirusTotal API key</label><input id="vt-key" type="password" autocomplete="off" placeholder="Paste API key (used only for this session)"><span class="hint">Key is not saved. Reputation lookup only; no email content or files are uploaded.</span></div>
+<div class="actions"><span class="hint">Local only · Maximum 1 MB</span><button id="analyze">Analyze email</button></div>
+<div class="vt-config"><label for="vt-key">VirusTotal API key</label><input id="vt-key" type="password" autocomplete="off" placeholder="VirusTotal API key (session only)">
+<label for="abuse-key">AbuseIPDB API key</label><input id="abuse-key" type="password" autocomplete="off" placeholder="AbuseIPDB API key (session only)">
+<label for="urlhaus-key">URLhaus Auth-Key</label><input id="urlhaus-key" type="password" autocomplete="off" placeholder="URLhaus Auth-Key (if required by your account)">
+<label for="phishtank-key">PhishTank API key (optional)</label><input id="phishtank-key" type="password" autocomplete="off" placeholder="PhishTank app_key (optional)">
+<label for="otx-key">AlienVault OTX API key</label><input id="otx-key" type="password" autocomplete="off" placeholder="OTX API key (session only)">
+<span class="hint">Keys stay in this page session and are sent only to the local app, which forwards requests to the selected provider. Each service runs independently. URLhaus may require an Auth-Key depending on current API access.</span></div>
 </section>
 <section id="results" class="panel results" aria-live="polite"><p class="empty">Your analysis will appear here.</p></section>
 </div></main>
@@ -84,35 +90,41 @@ function show(d){
  });
  section(results,'Attachments ('+d.attachments.length+')');
  renderRows(results,d.attachments,(li,x)=>{el(li,'b',x.filename||'[unnamed attachment]');el(li,'small','MIME: '+x.content_type+' · Size: '+x.size_bytes+' bytes');el(li,'small','SHA-256: '+x.sha256);if(x.risky)el(li,'span','Potentially risky file type','pill bad');if(x.extension_mismatch)el(li,'span','Extension/MIME mismatch — review','pill bad')});
- section(results,'VirusTotal reputation check');
- const vtbox=el(results,'div','','vt-panel');
- el(vtbox,'p','VirusTotal has not been queried yet. Add your API key above, then select Check VirusTotal. Existing reports are queried only; this tool does not upload email contents, URLs, or attachments.','hint');
- const vtActions=el(vtbox,'div','','actions');
- const vtBtn=el(vtActions,'button','Check VirusTotal','secondary');vtBtn.type='button';
- const vtStatus=el(vtbox,'div','','vt-results');
- vtBtn.addEventListener('click',async()=>{
-   const key=document.querySelector('#vt-key').value.trim();
-   if(!key){vtStatus.replaceChildren();el(vtStatus,'p','Enter your VirusTotal API key first.','error');return}
-   vtBtn.disabled=true;vtBtn.textContent='Checking…';vtStatus.replaceChildren();el(vtStatus,'p','Querying existing reputation reports. Public API limits may apply.','hint');
-   try{
-     const resp=await fetch('/virustotal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key,links:d.links.map(x=>x.url),hashes:d.attachments.map(x=>x.sha256)})});
-     const data=await resp.json();vtStatus.replaceChildren();
-     if(!resp.ok||data.error){el(vtStatus,'p',data.error||'VirusTotal lookup failed.','error')}
-     else{
-       el(vtStatus,'p',data.note||'Lookup complete.','hint');
-       if(!data.results||!data.results.length){empty(vtStatus,'No indicators were available to check.');}
-       else for(const item of data.results){
-         const card=el(vtStatus,'div','','vt-card');
-         el(card,'b',item.indicator);
-         el(card,'span',item.kind+' · '+item.status,'pill '+(item.status==='Malicious'?'bad':item.status==='No detections'?'good':''));
-         if(item.detections!==undefined)el(card,'p',item.detections+' malicious · '+item.suspicious+' suspicious · '+item.harmless+' harmless · '+item.undetected+' undetected');
-         if(item.message)el(card,'p',item.message,'hint');
-         if(item.url){const a=el(card,'a','Open VirusTotal report');a.href=item.url;a.target='_blank';a.rel='noopener noreferrer';a.referrerPolicy='no-referrer'}
+ const providers=[
+   {id:'virustotal',title:'VirusTotal',key:'vt-key',description:'Checks existing reports for URLs and attachment SHA-256 hashes.',payload:()=>({api_key:document.querySelector('#vt-key').value.trim(),links:d.links.map(x=>x.url),hashes:d.attachments.map(x=>x.sha256)})},
+   {id:'abuseipdb',title:'AbuseIPDB',key:'abuse-key',description:'Checks the reputation and abuse reports for extracted IPv4 addresses.',payload:()=>({api_key:document.querySelector('#abuse-key').value.trim(),ips:d.iocs['IPv4 addresses']||[]})},
+   {id:'urlhaus',title:'URLhaus',key:'urlhaus-key',description:'Checks extracted URLs against malware-distribution URLhaus records.',payload:()=>({api_key:document.querySelector('#urlhaus-key').value.trim(),links:d.links.map(x=>x.url)})},
+   {id:'phishtank',title:'PhishTank',key:'phishtank-key',description:'Checks whether extracted URLs are listed as reported phishing URLs.',payload:()=>({api_key:document.querySelector('#phishtank-key').value.trim(),links:d.links.map(x=>x.url)})},
+   {id:'otx',title:'AlienVault OTX',key:'otx-key',description:'Checks extracted IPs, domains and attachment SHA-256 hashes against OTX.',payload:()=>({api_key:document.querySelector('#otx-key').value.trim(),ips:d.iocs['IPv4 addresses']||[],domains:d.iocs['Domains']||[],hashes:d.attachments.map(x=>x.sha256)})}
+ ];
+ for(const provider of providers){
+   section(results,provider.title+' Threat Intelligence check');
+   const box=el(results,'div','','vt-panel');el(box,'p',provider.description,'hint');
+   const actions=el(box,'div','','actions');const btn=el(actions,'button','Check '+provider.title,'secondary');btn.type='button';
+   const status=el(box,'div','','vt-results');
+   btn.addEventListener('click',async()=>{
+     const payload=provider.payload();
+     if(provider.id!=='urlhaus' && !payload.api_key){status.replaceChildren();el(status,'p','Enter the '+provider.title+' API key above first.','error');return}
+     btn.disabled=true;btn.textContent='Checking…';status.replaceChildren();el(status,'p','Querying '+provider.title+' reputation data…','hint');
+     try{
+       const resp=await fetch('/threatintel/'+provider.id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+       const data=await resp.json();status.replaceChildren();
+       if(!resp.ok||data.error){el(status,'p',data.error||provider.title+' lookup failed.','error')}
+       else{
+         el(status,'p',data.note||'Lookup complete.','hint');
+         if(!data.results||!data.results.length)empty(status,'No indicators were available to check.');
+         else for(const item of data.results){
+           const card=el(status,'div','','vt-card');el(card,'b',item.indicator||'Indicator');
+           el(card,'span',(item.kind||provider.title)+' · '+(item.status||'Checked'),'pill '+(/malicious|phishing|listed|abusive|high risk|blacklisted/i.test(item.status||'')?'bad':/not found|no report|clean|not listed|no detections/i.test(item.status||'')?'good':''));
+           if(item.summary)el(card,'p',item.summary);
+           if(item.message)el(card,'p',item.message,'hint');
+           if(item.url){const a=el(card,'a','Open provider report');a.href=item.url;a.target='_blank';a.rel='noopener noreferrer';a.referrerPolicy='no-referrer'}
+         }
        }
-     }
-   }catch(e){vtStatus.replaceChildren();el(vtStatus,'p','Could not reach the local VirusTotal endpoint. Is the app running?','error')}
-   finally{vtBtn.disabled=false;vtBtn.textContent='Check VirusTotal'}
- });
+     }catch(e){status.replaceChildren();el(status,'p','Could not reach the local '+provider.title+' endpoint. Is the app running?','error')}
+     finally{btn.disabled=false;btn.textContent='Check '+provider.title}
+   });
+ }
  section(results,'Indicators of compromise (IOCs)');const ioc=el(results,'div','','grid');
  for(const [label,values] of Object.entries(d.iocs)){const tile=el(ioc,'div','','tile');el(tile,'b',label);el(tile,'span',values.length?values.join(', '):'None found')}
  section(results,'Email body');
@@ -120,7 +132,7 @@ function show(d){
  const html=el(results,'details');el(html,'summary','View HTML body as inert source');el(html,'pre',d.body.html||'[No HTML body found.]');
  const raw=el(results,'details');el(raw,'summary','View selected raw headers');el(raw,'pre',d.raw_headers||'[No headers found.]');
  const actions=el(results,'div','','actions');const exportBtn=el(actions,'button','Download JSON report','secondary');exportBtn.type='button';exportBtn.addEventListener('click',()=>{const blob=new Blob([JSON.stringify(lastReport,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='mail-check-report.json';a.click();URL.revokeObjectURL(url)});
- el(results,'p','Screening aid only. Do not open suspicious attachments or visit suspicious links. Header values may be forged; confirm sensitive requests through a separate trusted channel. No external reputation checks are performed.','fineprint');
+ el(results,'p','Screening aid only. Do not open suspicious attachments or visit suspicious links. Header values may be forged; confirm sensitive requests through a separate trusted channel. External reputation checks are optional and each provider can fail independently.','fineprint');
 }
 button.addEventListener('click',async()=>{if(!input.value.trim()){showError('Paste an email message before analyzing.');return}button.disabled=true;button.textContent='Checking...';try{const r=await fetch('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:input.value})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Could not analyze this message.');show(d)}catch(e){showError(e.message)}finally{button.disabled=false;button.textContent='Analyze email'}});
 </script></body></html>"""
@@ -388,6 +400,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/virustotal":
             self.handle_virustotal()
             return
+        if self.path.startswith("/threatintel/"):
+            service = self.path.rsplit("/", 1)[-1]
+            self.handle_threatintel(service)
+            return
         if self.path != "/analyze":
             self.send_error(404)
             return
@@ -491,6 +507,142 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self.send_json({"error": "VirusTotal lookup failed."}, 500)
 
+    def read_api_payload(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > 200_000:
+            raise ValueError("Invalid request size.")
+        payload = json.loads(self.rfile.read(length))
+        if not isinstance(payload, dict):
+            raise ValueError("Request must be a JSON object.")
+        return payload
+
+    @staticmethod
+    def api_json(url, headers=None, data=None, timeout=12):
+        body = None
+        req_headers = {"User-Agent": "MailCheck-local/1.1", "Accept": "application/json"}
+        if headers:
+            req_headers.update(headers)
+        if data is not None:
+            body = urlencode(data).encode("utf-8")
+            req_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        req = Request(url, data=body, headers=req_headers)
+        with urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+
+    def handle_threatintel(self, service):
+        allowed = {"abuseipdb", "urlhaus", "phishtank", "otx"}
+        if service not in allowed:
+            self.send_json({"error": "Unknown threat-intelligence service."}, 404)
+            return
+        try:
+            payload = self.read_api_payload()
+            api_key = payload.get("api_key", "")
+            if not isinstance(api_key, str) or len(api_key) > 500:
+                self.send_json({"error": "Invalid API key value."}, 400)
+                return
+            results = []
+            if service == "abuseipdb":
+                if not api_key.strip():
+                    self.send_json({"error": "Enter an AbuseIPDB API key."}, 400); return
+                ips = self.clean_indicators(payload.get("ips", []), r"(?:\d{1,3}\.){3}\d{1,3}", 5)
+                for ip in ips:
+                    try:
+                        data = self.api_json("https://api.abuseipdb.com/api/v2/check?" + urlencode({"ipAddress": ip, "maxAgeInDays": "90"}),
+                                             {"Key": api_key.strip(), "Accept": "application/json"})
+                        d = data.get("data", {})
+                        score = int(d.get("abuseConfidenceScore", 0) or 0)
+                        status = "Abusive / high risk" if score >= 50 else ("Reported / review" if score > 0 else "No abuse confidence")
+                        results.append({"kind":"IPv4", "indicator":ip, "status":status,
+                                        "summary":f"Abuse confidence: {score}% · Reports: {d.get('totalReports', 0)} · ISP: {d.get('isp', 'unknown')} · Country: {d.get('countryCode', 'unknown')}",
+                                        "url":"https://www.abuseipdb.com/check/" + ip})
+                    except Exception as exc: results.append(self.lookup_error("IPv4", ip, exc))
+                note = "Checked up to 5 IP addresses. Abuse confidence is a signal, not proof of malicious activity."
+            elif service == "urlhaus":
+                links = self.clean_indicators(payload.get("links", []), r"https?://\S+", 5)
+                for link in links:
+                    try:
+                        headers = {"Auth-Key": api_key.strip()} if api_key.strip() else {}
+                        data = self.api_json("https://urlhaus-api.abuse.ch/v1/url/", headers, {"url": link})
+                        if data.get("query_status") == "ok":
+                            info = data.get("url", {}) if isinstance(data.get("url"), dict) else data
+                            threat = info.get("threat", "malware")
+                            results.append({"kind":"URL", "indicator":link, "status":"Listed — malware URL",
+                                            "summary":f"Threat: {threat} · URL status: {info.get('url_status', 'unknown')} · Host: {info.get('host', 'unknown')}",
+                                            "url":info.get("urlhaus_reference") or "https://urlhaus.abuse.ch/browse/"})
+                        elif data.get("query_status") in ("no_results", "invalid_url"):
+                            results.append({"kind":"URL", "indicator":link, "status":"Not found in URLhaus", "summary":"No matching URLhaus record was returned."})
+                        else:
+                            results.append({"kind":"URL", "indicator":link, "status":"Unavailable", "message":"URLhaus response: " + str(data.get("query_status", "unexpected response"))})
+                    except HTTPError as exc:
+                        msg = "URLhaus rejected the request (HTTP " + str(exc.code) + "). Check whether an Auth-Key is required and valid."
+                        results.append({"kind":"URL", "indicator":link, "status":"Unavailable", "message":msg})
+                    except Exception as exc: results.append(self.lookup_error("URL", link, exc))
+                note = "Checked up to 5 URLs against URLhaus. A missing match does not prove a URL is safe."
+            elif service == "phishtank":
+                links = self.clean_indicators(payload.get("links", []), r"https?://\S+", 5)
+                for link in links:
+                    try:
+                        form = {"url": link, "format": "json"}
+                        if api_key.strip(): form["app_key"] = api_key.strip()
+                        data = self.api_json("https://checkurl.phishtank.com/checkurl/", {"User-Agent": "phishtank/mailcheck"}, form)
+                        item = data.get("results", {}) if isinstance(data.get("results"), dict) else {}
+                        if item.get("in_database") and item.get("valid"):
+                            status = "Confirmed phishing listing"
+                        elif item.get("in_database"):
+                            status = "Listed — validity not confirmed"
+                        else:
+                            status = "Not listed in PhishTank"
+                        results.append({"kind":"URL", "indicator":link, "status":status,
+                                        "summary":f"In database: {item.get('in_database', False)} · Valid: {item.get('valid', False)} · Verified: {item.get('verified', False)}",
+                                        "url":item.get("phish_detail_page")})
+                    except Exception as exc: results.append(self.lookup_error("URL", link, exc))
+                note = "Checked up to 5 URLs against PhishTank. Not listed does not mean safe. API key is optional where supported."
+            else:  # AlienVault OTX
+                if not api_key.strip():
+                    self.send_json({"error": "Enter an AlienVault OTX API key."}, 400); return
+                ips = self.clean_indicators(payload.get("ips", []), r"(?:\d{1,3}\.){3}\d{1,3}", 3)
+                domains = self.clean_indicators(payload.get("domains", []), r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}", 3)
+                hashes = self.clean_indicators(payload.get("hashes", []), r"[a-fA-F0-9]{64}", 3)
+                indicators = [("IPv4", "IPv4", x) for x in ips] + [("domain", "domain", x) for x in domains] + [("file hash", "file", x.lower()) for x in hashes]
+                for kind, path_kind, value in indicators[:8]:
+                    try:
+                        url = "https://otx.alienvault.com/api/v1/indicators/" + path_kind + "/" + value + "/general"
+                        data = self.api_json(url, {"X-OTX-API-KEY": api_key.strip()})
+                        pulse_count = int(data.get("pulse_info", {}).get("count", 0) or 0)
+                        status = "Threat pulses found" if pulse_count else "No threat pulses found"
+                        results.append({"kind":kind, "indicator":value, "status":status,
+                                        "summary":f"Pulse count: {pulse_count} · Reputation: {data.get('reputation', 'not provided')}",
+                                        "url":"https://otx.alienvault.com/indicator/" + path_kind + "/" + value})
+                    except Exception as exc: results.append(self.lookup_error(kind, value, exc))
+                note = "Checked up to 8 IP/domain/hash indicators against OTX. Pulse absence is not proof of safety."
+            self.send_json({"results": results, "note": note})
+        except (ValueError, json.JSONDecodeError):
+            self.send_json({"error": "Could not parse threat-intelligence request."}, 400)
+        except Exception:
+            self.send_json({"error": "Threat-intelligence lookup failed."}, 500)
+
+    @staticmethod
+    def clean_indicators(values, pattern, limit):
+        if not isinstance(values, list): return []
+        out = []
+        for value in values:
+            if isinstance(value, str):
+                value = value.strip()
+                if value and re.fullmatch(pattern, value, re.I) and value not in out:
+                    out.append(value)
+            if len(out) >= limit: break
+        return out
+
+    @staticmethod
+    def lookup_error(kind, indicator, exc):
+        if isinstance(exc, HTTPError):
+            message = "Provider returned HTTP " + str(exc.code) + ". Check API key, permissions and rate limits."
+        elif isinstance(exc, URLError) or isinstance(exc, TimeoutError):
+            message = "Network error or provider timeout."
+        else:
+            message = "Provider returned an unexpected response."
+        return {"kind": kind, "indicator": indicator, "status": "Unavailable", "message": message}
+
     def send_json(self, payload, status=200):
         content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -508,6 +660,7 @@ if __name__ == "__main__":
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Mail Check is running at http://127.0.0.1:{PORT}")
     print("Press Ctrl+C to stop.")
+    print("Optional threat-intelligence providers: VirusTotal, AbuseIPDB, URLhaus, PhishTank, AlienVault OTX.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
